@@ -1,0 +1,35 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../data:/app/data
+
+  app:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.app
+    ports:
+      - "8501:8501"
+    environment:
+      - STREAMLIT_SERVER_HEADLESS=true
+    depends_on:
+      - api
+
+  scheduler:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.api
+    command: ["python", "-m", "src.jobs.run_pipeline"]
+    volumes:
+      - ../data:/app/data
+    depends_on:
+      - api
+
+  db:
+    image: python:3.12-slim
+    command: ["python", "-c", "import time; time.sleep(3600)"]
+    profiles: ["optional-db"]
