@@ -18,6 +18,11 @@ def predict_route(payload: NowcastRequest) -> NowcastResponse:
     if not model_path.exists():
         raise HTTPException(status_code=400, detail="Model not found. Run /pipeline/run first.")
     bundle = load_model(model_path)
+    if bundle.get("data_mode") != "real":
+        raise HTTPException(
+            status_code=400,
+            detail="Model artifact is not verified as real-data. Run /pipeline/run first.",
+        )
     latest_row = bundle["latest_row"]
     response = predict_nowcast(
         model=bundle["model"],
@@ -25,6 +30,7 @@ def predict_route(payload: NowcastRequest) -> NowcastResponse:
         latest_row=latest_row,
         reference_month=payload.reference_month,
         features_override=payload.features_override,
+        uncertainty=bundle.get("uncertainty"),
+        data_mode=bundle["data_mode"],
     )
     return NowcastResponse(**response)
-

@@ -7,10 +7,12 @@ from fastapi import APIRouter, HTTPException
 from src.api.schemas import (
     DataQualityResponse,
     PipelineRunResponse,
+    ReadinessAssessment,
     RealAcceptanceResponse,
     SourceValidationResponse,
 )
 from src.jobs.data_quality_report import run_data_quality_report
+from src.jobs.readiness_assessment import assess_readiness_from_artifacts
 from src.jobs.run_pipeline import run_pipeline
 from src.jobs.run_real_acceptance import run_real_acceptance
 from src.jobs.validate_sources import validate_sources
@@ -47,5 +49,13 @@ def run_real_acceptance_route() -> RealAcceptanceResponse:
 def data_quality_route() -> DataQualityResponse:
     try:
         return DataQualityResponse(**run_data_quality_report(ROOT))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/pipeline/readiness", response_model=ReadinessAssessment)
+def readiness_route() -> ReadinessAssessment:
+    try:
+        return ReadinessAssessment(**assess_readiness_from_artifacts(ROOT))
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

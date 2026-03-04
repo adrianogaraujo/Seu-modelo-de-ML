@@ -7,24 +7,18 @@ import unittest
 from unittest.mock import patch
 
 sys.path.append(str(Path(__file__).resolve().parents[2]))
-from src.config.runtime import allow_synthetic_data  # noqa: E402
+from src.config.runtime import app_env  # noqa: E402
 
 
 class RuntimeConfigTest(unittest.TestCase):
-    def test_synthetic_disabled_by_default(self):
+    def test_app_env_defaults_to_prod(self):
         with patch.dict(os.environ, {}, clear=True):
-            self.assertFalse(allow_synthetic_data())
+            self.assertEqual(app_env(), "prod")
 
-    def test_synthetic_requires_dev_like_env(self):
-        with patch.dict(os.environ, {"ALLOW_SYNTHETIC_DATA": "1", "APP_ENV": "prod"}, clear=True):
-            with self.assertRaises(RuntimeError):
-                allow_synthetic_data()
-
-    def test_synthetic_allowed_in_test_env(self):
-        with patch.dict(os.environ, {"ALLOW_SYNTHETIC_DATA": "1", "APP_ENV": "test"}, clear=True):
-            self.assertTrue(allow_synthetic_data())
+    def test_app_env_is_normalized(self):
+        with patch.dict(os.environ, {"APP_ENV": " TeSt "}, clear=True):
+            self.assertEqual(app_env(), "test")
 
 
 if __name__ == "__main__":
     unittest.main()
-

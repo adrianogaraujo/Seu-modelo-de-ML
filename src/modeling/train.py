@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List
 
+import numpy as np
 import pandas as pd
 from sklearn.linear_model import ElasticNet
 from sklearn.model_selection import TimeSeriesSplit
@@ -16,6 +17,7 @@ class TrainOutput:
     feature_columns: List[str]
     metrics: Dict[str, float]
     predictions_df: pd.DataFrame
+    uncertainty: Dict[str, float]
 
 
 def train_baseline(df: pd.DataFrame) -> TrainOutput:
@@ -36,6 +38,14 @@ def train_baseline(df: pd.DataFrame) -> TrainOutput:
 
     valid_mask = oof_predictions.notna()
     metrics = evaluate_regression(y[valid_mask], oof_predictions[valid_mask])
+    residuals = (y[valid_mask] - oof_predictions[valid_mask]).astype(float)
+    if residuals.empty:
+        residuals = (y - model.fit(X, y).predict(X)).astype(float)
+    uncertainty = {
+        "residual_std": round(float(residuals.std(ddof=0)), 6),
+        "lower_residual_quantile": round(float(np.quantile(residuals, 0.1)), 6),
+        "upper_residual_quantile": round(float(np.quantile(residuals, 0.9)), 6),
+    }
 
     model.fit(X, y)
     full_predictions = model.predict(X)
@@ -47,5 +57,5 @@ def train_baseline(df: pd.DataFrame) -> TrainOutput:
         feature_columns=feature_cols,
         metrics=metrics,
         predictions_df=pred_df,
+        uncertainty=uncertainty,
     )
-

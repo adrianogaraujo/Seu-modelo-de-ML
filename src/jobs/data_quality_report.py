@@ -7,7 +7,6 @@ from typing import Dict
 
 import pandas as pd
 
-from src.config.runtime import allow_synthetic_data
 from src.ingestion.bcb_client import BCBClient
 from src.ingestion.caged_client import CAGEDClient
 from src.ingestion.sidra_client import SIDRAClient
@@ -26,6 +25,8 @@ def _month_span(min_month: str | None, max_month: str | None) -> int:
 def _source_quality(df: pd.DataFrame) -> Dict[str, object]:
     if df.empty:
         return {
+            "mode": "real",
+            "configured": True,
             "rows": 0,
             "min_month": None,
             "max_month": None,
@@ -56,6 +57,8 @@ def _source_quality(df: pd.DataFrame) -> Dict[str, object]:
         status = "warn"
 
     return {
+        "mode": "real",
+        "configured": True,
         "rows": int(len(df)),
         "min_month": min_month,
         "max_month": max_month,
@@ -68,14 +71,13 @@ def _source_quality(df: pd.DataFrame) -> Dict[str, object]:
 
 
 def run_data_quality_report(_: Path | None = None) -> Dict[str, object]:
-    allow_synthetic = allow_synthetic_data()
     start = os.getenv("SOURCE_VALIDATION_START", "2024-01")
     end = os.getenv("SOURCE_VALIDATION_END", "2026-01")
 
     clients = {
-        "bcb": BCBClient(allow_synthetic=allow_synthetic),
-        "sidra": SIDRAClient(allow_synthetic=allow_synthetic),
-        "caged": CAGEDClient(allow_synthetic=allow_synthetic),
+        "bcb": BCBClient(),
+        "sidra": SIDRAClient(),
+        "caged": CAGEDClient(),
     }
 
     source_frames: Dict[str, pd.DataFrame] = {}
@@ -103,7 +105,6 @@ def run_data_quality_report(_: Path | None = None) -> Dict[str, object]:
     return {
         "status": overall_status,
         "window": {"start": start, "end": end},
-        "allow_synthetic_data": allow_synthetic,
         "sources": source_reports,
         "merged": {
             "common_months": common_months,

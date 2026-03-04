@@ -19,14 +19,7 @@ class IngestionClientsTest(unittest.TestCase):
         os.environ.pop("BCB_TARGET_SERIES_CODE", None)
         os.environ.pop("BCB_NORTH_PROXY_SERIES_CODE", None)
         with self.assertRaises(RuntimeError):
-            BCBClient(use_real=True, allow_synthetic=False).fetch_monthly("2025-01", "2025-03")
-
-    def test_bcb_fallback_allowed_when_explicit(self):
-        os.environ.pop("BCB_TARGET_SERIES_CODE", None)
-        os.environ.pop("BCB_NORTH_PROXY_SERIES_CODE", None)
-        df = BCBClient(use_real=True, allow_synthetic=True).fetch_monthly("2025-01", "2025-03")
-        self.assertEqual(list(df.columns), ["year_month", "north_proxy", "target_default_rate"])
-        self.assertEqual(len(df), 3)
+            BCBClient(use_real=True).fetch_monthly("2025-01", "2025-03")
 
     def test_bcb_real_path_with_mocked_series(self):
         with patch.dict(
@@ -97,6 +90,16 @@ class IngestionClientsTest(unittest.TestCase):
             self.assertEqual(len(df), 2)
             self.assertEqual(float(df.iloc[0]["am_net_jobs"]), 20.0)
             self.assertEqual(float(df.iloc[1]["am_net_jobs"]), -10.0)
+
+    def test_sidra_without_url_fails(self):
+        with patch.dict(os.environ, {"SIDRA_AM_URL": ""}, clear=False):
+            with self.assertRaises(RuntimeError):
+                SIDRAClient(use_real=True).fetch_monthly("2025-01", "2025-02")
+
+    def test_caged_without_urls_fails(self):
+        with patch.dict(os.environ, {"CAGED_AM_CSV_URL": "", "CAGED_AM_XLSX_URL": ""}, clear=False):
+            with self.assertRaises(RuntimeError):
+                CAGEDClient(use_real=True).fetch_monthly("2025-01", "2025-02")
 
 
 if __name__ == "__main__":

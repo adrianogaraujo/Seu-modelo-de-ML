@@ -12,34 +12,34 @@ class HealthResponse(BaseModel):
     timestamp: datetime
 
 
+class DataSourceProvenance(BaseModel):
+    mode: str
+    configured: bool
+    rows: int
+    min_month: str | None
+    max_month: str | None
+
+
 class PipelineRunResponse(BaseModel):
     status: str
     rows_raw: int
     rows_training: int
     metrics: Dict[str, float]
+    data_provenance: Dict[str, DataSourceProvenance]
 
 
-class SourceValidationSummary(BaseModel):
-    rows: int
-    min_month: str | None
-    max_month: str | None
+class SourceValidationSummary(DataSourceProvenance):
+    pass
 
 
 class SourceValidationResponse(BaseModel):
     status: str
     window: Dict[str, str]
     sources: Dict[str, SourceValidationSummary]
-    allow_synthetic_data: bool
-
-
-class RealAcceptanceResponse(BaseModel):
-    status: str
-    checks: Dict[str, bool]
-    sources: Dict[str, SourceValidationSummary]
-    pipeline: PipelineRunResponse
-
 
 class DataQualitySourceSummary(BaseModel):
+    mode: str
+    configured: bool
     rows: int
     min_month: str | None
     max_month: str | None
@@ -60,9 +60,32 @@ class DataQualityMergedSummary(BaseModel):
 class DataQualityResponse(BaseModel):
     status: str
     window: Dict[str, str]
-    allow_synthetic_data: bool
     sources: Dict[str, DataQualitySourceSummary]
     merged: DataQualityMergedSummary
+
+
+class ReadinessCheck(BaseModel):
+    name: str
+    band: str
+    passed: bool
+    actual: float | int | str | bool | None
+    expected: str
+    message: str
+
+
+class ReadinessAssessment(BaseModel):
+    status: str
+    recommendation: str
+    checks: List[ReadinessCheck]
+    summary: Dict[str, float | int | str | bool | None]
+
+
+class RealAcceptanceResponse(BaseModel):
+    status: str
+    checks: Dict[str, bool]
+    sources: Dict[str, SourceValidationSummary]
+    pipeline: PipelineRunResponse
+    readiness: ReadinessAssessment
 
 
 class NowcastRequest(BaseModel):
@@ -80,6 +103,7 @@ class NowcastResponse(BaseModel):
     y_hat: float
     lower: float
     upper: float
+    data_mode: str
     drivers: List[Driver]
 
 

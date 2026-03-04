@@ -5,7 +5,6 @@ from typing import Dict
 
 import pandas as pd
 
-from src.config.runtime import allow_synthetic_data
 from src.ingestion.bcb_client import BCBClient
 from src.ingestion.caged_client import CAGEDClient
 from src.ingestion.sidra_client import SIDRAClient
@@ -23,15 +22,29 @@ from src.storage.sqlite_store import (
 )
 
 
+def _provenance(df: pd.DataFrame) -> Dict[str, object]:
+    return {
+        "mode": "real",
+        "configured": True,
+        "rows": int(len(df)),
+        "min_month": str(df["year_month"].min()) if not df.empty else None,
+        "max_month": str(df["year_month"].max()) if not df.empty else None,
+    }
+
+
 def run_pipeline(root: Path) -> Dict[str, object]:
     ensure_dirs(root)
     db_path = root / "data" / "db" / "risk_mvp.sqlite"
     init_db(db_path)
-    allow_synthetic = allow_synthetic_data()
 
-    bcb_df = BCBClient(allow_synthetic=allow_synthetic).fetch_monthly()
-    sidra_df = SIDRAClient(allow_synthetic=allow_synthetic).fetch_monthly()
-    caged_df = CAGEDClient(allow_synthetic=allow_synthetic).fetch_monthly()
+    bcb_df = BCBClient().fetch_monthly()
+    sidra_df = SIDRAClient().fetch_monthly()
+    caged_df = CAGEDClient().fetch_monthly()
+    data_provenance = {
+        "bcb": _provenance(bcb_df),
+        "sidra": _provenance(sidra_df),
+        "caged": _provenance(caged_df),
+    }
     merged = align_monthly_tables(bcb_df, sidra_df, caged_df)
     cleaned = apply_quality_rules(merged)
     featured = build_features(cleaned)
@@ -50,6 +63,9 @@ def run_pipeline(root: Path) -> Dict[str, object]:
             "feature_columns": train_out.feature_columns,
             "latest_row": featured.iloc[-1].to_dict(),
             "latest_month": str(featured.iloc[-1]["year_month"]),
+            "uncertainty": train_out.uncertainty,
+            "data_mode": "real",
+            "data_provenance": data_provenance,
         },
         root / "data" / "artifacts" / "baseline_model.joblib",
     )
@@ -59,6 +75,7 @@ def run_pipeline(root: Path) -> Dict[str, object]:
         "rows_raw": int(len(merged)),
         "rows_training": int(len(featured)),
         "metrics": train_out.metrics,
+        "data_provenance": data_provenance,
     }
 
 

@@ -7,7 +7,6 @@ import os
 import re
 import unicodedata
 
-import numpy as np
 import pandas as pd
 import requests
 
@@ -16,33 +15,33 @@ import requests
 class CAGEDClient:
     """CAGED client with strict-real mode by default."""
 
-    seed: int = 99
     use_real: bool = True
-    allow_synthetic: bool = False
     timeout: int = 20
 
     def fetch_monthly(self, start: str = "2018-01", end: str = "2026-01") -> pd.DataFrame:
-        if self.use_real:
-            caged_csv_url = os.getenv("CAGED_AM_CSV_URL", "").strip()
-            caged_xlsx_url = os.getenv("CAGED_AM_XLSX_URL", "").strip()
-            try:
-                if caged_csv_url:
-                    df = self._fetch_real_csv(caged_csv_url)
-                elif caged_xlsx_url:
-                    df = self._fetch_real_xlsx(caged_xlsx_url)
-                elif not self.allow_synthetic:
-                    raise RuntimeError("CAGED requires env var CAGED_AM_CSV_URL or CAGED_AM_XLSX_URL.")
-                else:
-                    df = pd.DataFrame()
-                if not df.empty:
-                    mask = (df["year_month"] >= start) & (df["year_month"] <= end)
-                    return df.loc[mask].reset_index(drop=True)
-            except Exception as exc:
-                if not self.allow_synthetic:
-                    raise RuntimeError(f"CAGED ingestion failed: {exc}") from exc
-        if self.allow_synthetic:
-            return self._fetch_synthetic(start, end)
-        raise RuntimeError("CAGED real ingestion unavailable and synthetic fallback is disabled.")
+        if not self.use_real:
+            raise RuntimeError("CAGED supports only real ingestion.")
+
+        caged_csv_url = os.getenv("CAGED_AM_CSV_URL", "").strip()
+        caged_xlsx_url = os.getenv("CAGED_AM_XLSX_URL", "").strip()
+        if not caged_csv_url and not caged_xlsx_url:
+            raise RuntimeError("CAGED missing configuration: set CAGED_AM_CSV_URL or CAGED_AM_XLSX_URL.")
+
+        try:
+            if caged_csv_url:
+                df = self._fetch_real_csv(caged_csv_url)
+            else:
+                df = self._fetch_real_xlsx(caged_xlsx_url)
+        except requests.RequestException as exc:
+            raise RuntimeError(f"CAGED upstream fetch failed: {exc}") from exc
+        except Exception as exc:
+            raise RuntimeError(f"CAGED parse failed: {exc}") from exc
+
+        mask = (df["year_month"] >= start) & (df["year_month"] <= end)
+        out = df.loc[mask].reset_index(drop=True)
+        if out.empty:
+            raise RuntimeError(f"CAGED no rows in requested range: {start}..{end}.")
+        return out
 
     def _fetch_real_csv(self, url: str) -> pd.DataFrame:
         response = requests.get(url, timeout=self.timeout)
@@ -162,10 +161,3 @@ class CAGEDClient:
         if m and m.group(1) in month_map:
             return f"{m.group(2)}-{month_map[m.group(1)]}"
         return None
-
-    def _fetch_synthetic(self, start: str, end: str) -> pd.DataFrame:
-        months = pd.period_range(start=start, end=end, freq="M").astype(str)
-        rng = np.random.default_rng(self.seed)
-        t = np.arange(len(months))
-        am_net_jobs = 1200 + 30 * np.sin(t / 4) + 1.8 * t + rng.normal(0, 35, len(months))
-        return pd.DataFrame({"year_month": months, "am_net_jobs": am_net_jobs.round(2)})

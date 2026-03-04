@@ -19,6 +19,7 @@ class ValidateSourcesTest(unittest.TestCase):
                 with patch("src.jobs.validate_sources.CAGEDClient.fetch_monthly", return_value=frame):
                     out = validate_sources()
                     self.assertEqual(out["status"], "ok")
+                    self.assertEqual(out["sources"]["bcb"]["mode"], "real")
                     self.assertEqual(out["sources"]["bcb"]["rows"], 2)
                     self.assertEqual(out["sources"]["sidra"]["min_month"], "2025-01")
 
@@ -33,4 +34,3 @@ class ValidateSourcesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
