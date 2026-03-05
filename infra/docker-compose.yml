@@ -3,6 +3,8 @@ services:
     build:
       context: ..
       dockerfile: infra/Dockerfile.api
+    env_file:
+      - ../.env
     ports:
       - "8000:8000"
     volumes:
@@ -12,6 +14,8 @@ services:
     build:
       context: ..
       dockerfile: infra/Dockerfile.app
+    env_file:
+      - ../.env
     ports:
       - "8501:8501"
     environment:
@@ -23,6 +27,8 @@ services:
     build:
       context: ..
       dockerfile: infra/Dockerfile.api
+    env_file:
+      - ../.env
     command: ["python", "-m", "src.jobs.run_pipeline"]
     volumes:
       - ../data:/app/data

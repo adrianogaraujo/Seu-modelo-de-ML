@@ -26,8 +26,15 @@ cd project
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
+copy .env.example .env
 python -m unittest discover -s tests
 uvicorn src.api.main:app --reload
+```
+
+Em outro terminal, execute o dashboard:
+
+```bash
+streamlit run src/app/streamlit_app.py
 ```
 
 Para rodar um alvo menor durante desenvolvimento:
@@ -95,6 +102,7 @@ Por padrao o sistema exige dados reais e falha se as fontes nao estiverem config
 - `CAGED_AM_CSV_URL` ou `CAGED_AM_XLSX_URL`
 
 O projeto nao possui fallback sintetico. Se qualquer fonte estiver ausente, vazia, fora da janela ou invalida, o pipeline falha explicitamente.
+Para o caminho padrao de demo local, mantenha `CAGED_AM_CSV_URL` preenchida no `.env`.
 
 O endpoint de readiness usa bandas objetivas:
 
@@ -105,6 +113,35 @@ O endpoint de readiness usa bandas objetivas:
 Os thresholds atuais avaliam volume minimo por fonte, sobreposicao entre fontes, volume util de treino, artefato com `data_mode=real` e metricas normalizadas do baseline. Esse checklist vale para aceitacao do MVP, nao para aprovacao de producao regulatoria.
 
 Use o template `./.env.example` para preencher as variaveis necessarias. Nao versione seu arquivo `.env` com credenciais ou URLs internas.
+
+## Runbook de aceite minimo (Demo Local)
+
+1. Preencha `./.env` (copiando de `.env.example`) com URLs/codigos reais das 3 fontes.
+2. Rode pipeline completo:
+
+```bash
+python -m src.jobs.run_pipeline
+```
+
+3. Rode checklist de aceite real:
+
+```bash
+python -m src.jobs.run_real_acceptance
+```
+
+4. Com API no ar, valide endpoints:
+   - `GET /pipeline/validate-sources`
+   - `POST /pipeline/run`
+   - `GET /pipeline/readiness`
+   - `POST /predict/nowcast`
+   - `GET /series/target?from=YYYY-MM&to=YYYY-MM`
+
+### Criterio objetivo de viabilidade minima
+
+- `validate-sources` retorna `status=ok`
+- `run` retorna `rows_raw > 0` e `rows_training > 0`
+- `readiness.status` e `pass` ou `warn` (nao `fail`)
+- `predict/nowcast` retorna resposta valida com `data_mode=real`
 
 ## Seguranca e publicacao
 
