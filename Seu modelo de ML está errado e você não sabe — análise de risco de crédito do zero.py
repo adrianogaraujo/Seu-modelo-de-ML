@@ -13,8 +13,31 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
+def _detect_workspace_root() -> Path:
+    # Running as a script
+    if "__file__" in globals():
+        return Path(__file__).resolve().parent
 
-WORKSPACE_ROOT = Path(__file__).resolve().parent
+    # Running in REPL/Notebook/PyCharm console where __file__ is absent
+    candidates: list[Path] = [Path.cwd().resolve()]
+    for entry in sys.path:
+        if not entry:
+            continue
+        try:
+            candidate = Path(entry).resolve()
+        except Exception:
+            continue
+        candidates.append(candidate)
+
+    for candidate in candidates:
+        project_dir = candidate / "project"
+        if project_dir.exists() and (project_dir / "src").exists():
+            return candidate
+
+    return Path.cwd().resolve()
+
+
+WORKSPACE_ROOT = _detect_workspace_root()
 PROJECT_ROOT = WORKSPACE_ROOT / "project"
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -24,6 +47,42 @@ from src.jobs.readiness_assessment import assess_readiness_from_artifacts, asses
 from src.jobs.run_pipeline import run_pipeline  # noqa: E402
 from src.jobs.validate_sources import validate_sources  # noqa: E402
 from src.modeling.registry import load_model  # noqa: E402
+
+
+def _load_env_file(path: Path) -> bool:
+    if not path.exists():
+        return False
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key and key not in os.environ:
+            os.environ[key] = value
+    return True
+
+
+def _bootstrap_environment() -> Dict[str, Any]:
+    env_project = PROJECT_ROOT / ".env"
+    env_workspace = WORKSPACE_ROOT / ".env"
+    example_project = PROJECT_ROOT / ".env.example"
+    example_workspace = WORKSPACE_ROOT / ".env.example"
+
+    loaded = []
+    for candidate in (env_project, env_workspace, example_project, example_workspace):
+        if _load_env_file(candidate):
+            loaded.append(str(candidate))
+            break
+
+    return {
+        "loaded_files": loaded,
+        "used_fallback_example": any(path.endswith(".env.example") for path in loaded),
+    }
+
+
+BOOTSTRAP_ENV_INFO = _bootstrap_environment()
 
 
 # %% Constants and Data Contracts
@@ -300,6 +359,10 @@ def _print_report(report: ReproducibilityReport) -> None:
     print(f"project_root: {payload['project_root']}")
     print(f"python_version: {payload['python_version']}")
     print(f"app_env: {payload['environment']['app_env']}")
+    if BOOTSTRAP_ENV_INFO["loaded_files"]:
+        print(f"env_bootstrap: loaded_from={BOOTSTRAP_ENV_INFO['loaded_files'][0]}")
+    else:
+        print("env_bootstrap: no .env/.env.example found; using process environment only")
     print("sources:")
     for name, meta in payload["source_validation"]["sources"].items():
         print(
