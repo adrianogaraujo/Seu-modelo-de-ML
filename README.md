@@ -22,7 +22,6 @@ MVP local-first para nowcasting mensal de inadimplencia com foco no Amazonas. O 
 ## Executar localmente
 
 ```bash
-cd project
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
@@ -46,7 +45,7 @@ python -m unittest tests.unit.test_features
 ## Docker Compose
 
 ```bash
-cd project/infra
+cd infra
 docker compose up --build
 ```
 
@@ -69,6 +68,35 @@ Alternativa via CLI:
 
 ```bash
 python -m src.jobs.run_real_acceptance
+```
+
+## Fluxo de aula (YouTube)
+
+Para preparar e gravar aulas com reprodutibilidade:
+
+1. Gere um baseline real:
+
+```bash
+python -m src.jobs.run_pipeline
+python -m src.jobs.run_real_acceptance
+```
+
+2. Congele um snapshot local:
+
+```bash
+python scripts/create_snapshot.py --name 2026-03-06-course-baseline
+```
+
+3. Suba o projeto para aula em modo snapshot (sem depender de APIs externas):
+
+```powershell
+.\scripts\bootstrap_aula.ps1 -Mode snapshot -Snapshot 2026-03-06-course-baseline
+```
+
+4. Quando quiser atualizar com fontes reais:
+
+```powershell
+.\scripts\bootstrap_aula.ps1 -Mode real
 ```
 
 ## Desenvolvimento e TDD
