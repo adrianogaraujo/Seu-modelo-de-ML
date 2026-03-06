@@ -1,52 +1,106 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-# %% Imports and Project Bootstrap
-# Esta celula apenas prepara os imports e aponta o Python para `project/`.
-# Resultado esperado: nenhum output e nenhuma excecao.
-# Pare aqui se algum import falhar, porque o caminho do projeto ainda nao esta utilizavel.
-import argparse
+import importlib
 import json
 import os
+import sqlite3
+import subprocess
 import sys
+import time
+from contextlib import closing
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from io import StringIO
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
-def _detect_workspace_root() -> Path:
-    # Running as a script
+
+DEFAULT_ENV: dict[str, str] = {
+    "APP_ENV": "prod",
+    "BCB_TARGET_SERIES_CODE": "21085",
+    "BCB_NORTH_PROXY_SERIES_CODE": "24363",
+    "SIDRA_AM_URL": "https://apisidra.ibge.gov.br/values/t/7060/n1/all/v/63/p/all?formato=json",
+    "CAGED_AM_CSV_URL": "https://raw.githubusercontent.com/adrianogaraujo/Seu-modelo-de-ML/Main/datasets/caged_am_monthly.csv",
+    "SOURCE_VALIDATION_START": "2024-01",
+    "SOURCE_VALIDATION_END": "2026-01",
+    "PIPELINE_START": "2018-01",
+    "PIPELINE_END": "2026-01",
+}
+
+PACKAGE_MAP: dict[str, str] = {
+    "numpy": "numpy",
+    "pandas": "pandas",
+    "requests": "requests",
+    "joblib": "joblib",
+    "sklearn": "scikit-learn",
+}
+
+
+class PortableError(RuntimeError):
+    def __init__(self, code: int, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+@dataclass
+class RunPaths:
+    root: Path
+    output_root: Path
+    data_root: Path
+    raw_dir: Path
+    processed_dir: Path
+    artifacts_dir: Path
+    db_dir: Path
+    report_path: Path
+
+
+@dataclass
+class PortableReport:
+    generated_at_utc: str
+    python_version: str
+    app_env: str
+    runtime_paths: dict[str, str]
+    environment: dict[str, Any]
+    source_validation: dict[str, Any]
+    data_quality: dict[str, Any]
+    pipeline: dict[str, Any]
+    artifacts: dict[str, Any]
+    readiness: dict[str, Any]
+    replication_steps: list[str]
+
+
+def _detect_root() -> Path:
     if "__file__" in globals():
         return Path(__file__).resolve().parent
-
-    # Running in REPL/Notebook/PyCharm console where __file__ is absent
-    candidates: list[Path] = [Path.cwd().resolve()]
-    for entry in sys.path:
-        if not entry:
-            continue
-        try:
-            candidate = Path(entry).resolve()
-        except Exception:
-            continue
-        candidates.append(candidate)
-
-    for candidate in candidates:
-        project_dir = candidate / "project"
-        if project_dir.exists() and (project_dir / "src").exists():
-            return candidate
-
     return Path.cwd().resolve()
 
 
-WORKSPACE_ROOT = _detect_workspace_root()
-PROJECT_ROOT = WORKSPACE_ROOT / "project"
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+def _print(msg: str) -> None:
+    print(f"[portable-run] {msg}")
 
-from src.jobs.data_quality_report import run_data_quality_report  # noqa: E402
-from src.jobs.readiness_assessment import assess_readiness_from_artifacts, assess_readiness_from_run  # noqa: E402
-from src.jobs.run_pipeline import run_pipeline  # noqa: E402
-from src.jobs.validate_sources import validate_sources  # noqa: E402
-from src.modeling.registry import load_model  # noqa: E402
+
+def ensure_dependencies() -> None:
+    missing: list[str] = []
+    for module_name, pip_name in PACKAGE_MAP.items():
+        try:
+            importlib.import_module(module_name)
+        except Exception:
+            missing.append(pip_name)
+
+    if not missing:
+        return
+
+    _print(f"Installing missing dependencies: {', '.join(missing)}")
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
+    except Exception as exc:
+        raise PortableError(2, f"Dependency install failed: {exc}") from exc
+
+    for module_name in PACKAGE_MAP:
+        try:
+            importlib.import_module(module_name)
+        except Exception as exc:
+            raise PortableError(2, f"Dependency import failed after install: {module_name}") from exc
 
 
 def _load_env_file(path: Path) -> bool:
@@ -64,135 +118,564 @@ def _load_env_file(path: Path) -> bool:
     return True
 
 
-def _bootstrap_environment() -> Dict[str, Any]:
-    env_project = PROJECT_ROOT / ".env"
-    env_workspace = WORKSPACE_ROOT / ".env"
-    example_project = PROJECT_ROOT / ".env.example"
-    example_workspace = WORKSPACE_ROOT / ".env.example"
-
-    loaded = []
-    for candidate in (env_project, env_workspace, example_project, example_workspace):
+def bootstrap_env(root: Path) -> dict[str, Any]:
+    loaded_files: list[str] = []
+    for candidate in (root / ".env", root / ".env.example"):
         if _load_env_file(candidate):
-            loaded.append(str(candidate))
+            loaded_files.append(str(candidate))
             break
 
-    return {
-        "loaded_files": loaded,
-        "used_fallback_example": any(path.endswith(".env.example") for path in loaded),
-    }
+    defaults_applied: list[str] = []
+    for key, value in DEFAULT_ENV.items():
+        if not os.getenv(key):
+            os.environ[key] = value
+            defaults_applied.append(key)
 
-
-BOOTSTRAP_ENV_INFO = _bootstrap_environment()
-
-
-# %% Constants and Data Contracts
-# Essas variaveis globais permitem rodar uma celula por vez e inspecionar resultados intermediarios.
-# Resultado esperado: as variaveis de estado comecam como `None` e vao sendo preenchidas ao longo da execucao.
-REQUIRED_ENV_VARS = (
-    "BCB_TARGET_SERIES_CODE",
-    "BCB_NORTH_PROXY_SERIES_CODE",
-    "SIDRA_AM_URL",
-)
-OPTIONAL_ENV_GROUPS = (("CAGED_AM_CSV_URL", "CAGED_AM_XLSX_URL"),)
-ACTIVE_PROJECT_ROOT = PROJECT_ROOT
-
-ENVIRONMENT_SNAPSHOT: Dict[str, Any] | None = None
-SOURCE_VALIDATION_RESULT: Dict[str, Any] | None = None
-DATA_QUALITY_RESULT: Dict[str, Any] | None = None
-PIPELINE_RESULT: Dict[str, Any] | None = None
-ARTIFACT_SNAPSHOT: Dict[str, Any] | None = None
-READINESS_RESULT: Dict[str, Any] | None = None
-FINAL_REPORT: "ReproducibilityReport | None" = None
-
-
-@dataclass
-class ReproducibilityReport:
-    generated_at_utc: str
-    workspace_root: str
-    project_root: str
-    python_version: str
-    environment: Dict[str, Any]
-    source_validation: Dict[str, Any]
-    data_quality: Dict[str, Any]
-    pipeline: Dict[str, Any]
-    artifacts: Dict[str, Any]
-    readiness: Dict[str, Any]
-    replication_steps: list[str]
-
-
-# %% Environment Validation Helpers
-def _required_env_snapshot() -> Dict[str, Any]:
-    # Este helper nao consulta nenhuma fonte externa.
-    # Ele apenas verifica se a configuracao minima para dados reais esta presente.
-    values: Dict[str, Any] = {}
-    missing: list[str] = []
-
-    for name in REQUIRED_ENV_VARS:
-        value = os.getenv(name, "").strip()
-        values[name] = value
-        if not value:
-            missing.append(name)
-
-    caged_group = {name: os.getenv(name, "").strip() for name in OPTIONAL_ENV_GROUPS[0]}
-    values.update(caged_group)
-    if not any(caged_group.values()):
-        missing.append("CAGED_AM_CSV_URL|CAGED_AM_XLSX_URL")
+    required = [
+        "BCB_TARGET_SERIES_CODE",
+        "BCB_NORTH_PROXY_SERIES_CODE",
+        "SIDRA_AM_URL",
+        "CAGED_AM_CSV_URL",
+    ]
+    missing = [k for k in required if not os.getenv(k, "").strip()]
+    if missing:
+        raise PortableError(3, f"Missing required environment variables: {', '.join(missing)}")
 
     return {
-        "app_env": os.getenv("APP_ENV", "prod").strip() or "prod",
-        "required_values": values,
+        "loaded_files": loaded_files,
+        "defaults_applied": defaults_applied,
         "missing": missing,
         "is_ready": not missing,
     }
 
 
-# %% Step 1 - Select Project Root
-# Rode esta etapa primeiro se quiser apontar o fluxo para outro clone/caminho.
-# Resultado esperado: um caminho absoluto para o diretorio ativo do projeto.
-# Pare se o caminho estiver errado, porque todas as proximas etapas leem ou escrevem nele.
-def set_active_project_root(project_root: str | Path) -> Path:
-    global ACTIVE_PROJECT_ROOT
-    ACTIVE_PROJECT_ROOT = Path(project_root).resolve()
-    return ACTIVE_PROJECT_ROOT
+def _make_paths(root: Path) -> RunPaths:
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    output_root = root / "portable_output"
+    data_root = output_root / "data"
+    raw_dir = data_root / "raw"
+    processed_dir = data_root / "processed"
+    artifacts_dir = data_root / "artifacts"
+    db_dir = data_root / "db"
+    report_path = output_root / f"report-{ts}.json"
+
+    for path in (output_root, raw_dir, processed_dir, artifacts_dir, db_dir):
+        path.mkdir(parents=True, exist_ok=True)
+
+    return RunPaths(
+        root=root,
+        output_root=output_root,
+        data_root=data_root,
+        raw_dir=raw_dir,
+        processed_dir=processed_dir,
+        artifacts_dir=artifacts_dir,
+        db_dir=db_dir,
+        report_path=report_path,
+    )
 
 
-# %% Step 2 - Validate Environment Readiness
-# Rode esta etapa antes de consultar qualquer fonte.
-# Resultado esperado: `is_ready=True` e `missing=[]`.
-# Pare se `is_ready=False`; isso indica falha de configuracao, nao falha das fontes reais.
-def check_environment_readiness() -> Dict[str, Any]:
-    global ENVIRONMENT_SNAPSHOT
-    ENVIRONMENT_SNAPSHOT = _required_env_snapshot()
-    return ENVIRONMENT_SNAPSHOT
+def _import_runtime_libs() -> dict[str, Any]:
+    libs = {
+        "np": importlib.import_module("numpy"),
+        "pd": importlib.import_module("pandas"),
+        "requests": importlib.import_module("requests"),
+        "joblib": importlib.import_module("joblib"),
+    }
+    lm = importlib.import_module("sklearn.linear_model")
+    ms = importlib.import_module("sklearn.model_selection")
+    metrics = importlib.import_module("sklearn.metrics")
+    libs["ElasticNet"] = lm.ElasticNet
+    libs["TimeSeriesSplit"] = ms.TimeSeriesSplit
+    libs["mean_absolute_error"] = metrics.mean_absolute_error
+    libs["mean_squared_error"] = metrics.mean_squared_error
+    return libs
 
 
-# %% Artifact Inspection Helpers
-def _artifact_snapshot(project_root: Path) -> Dict[str, Any]:
-    # Este helper le os outputs locais depois que o pipeline roda.
-    # Use para confirmar que o modelo foi persistido e marcado explicitamente como dado real.
-    artifact_dir = project_root / "data" / "artifacts"
-    model_path = artifact_dir / "baseline_model.joblib"
-    metrics_path = artifact_dir / "metrics.json"
-    history_path = project_root / "data" / "processed" / "historical_predictions.csv"
-    dataset_path = project_root / "data" / "processed" / "monthly_dataset.csv"
-    db_path = project_root / "data" / "db" / "risk_mvp.sqlite"
+def _fetch_json_with_retry(requests: Any, url: str, timeout: int = 25, retries: int = 3) -> Any:
+    last_exc: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            response = requests.get(url, timeout=timeout)
+            response.raise_for_status()
+            return response.json()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(attempt)
+    raise PortableError(4, f"Upstream fetch failed for {url}: {last_exc}")
 
-    bundle: Dict[str, Any] | None = None
-    if model_path.exists():
-        bundle = load_model(model_path)
 
-    metrics_payload: Dict[str, Any] | None = None
-    if metrics_path.exists():
-        metrics_payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+def _to_float(raw: Any) -> float | None:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text or text in {"..", "-", "nan", "NaN"}:
+        return None
+    text = text.replace(" ", "")
+    # Normalize locale formats:
+    # - "1.234,56" -> "1234.56"
+    # - "1234,56"  -> "1234.56"
+    # - "1234.56"  -> "1234.56"
+    if "," in text and "." in text:
+        text = text.replace(".", "").replace(",", ".")
+    elif "," in text:
+        text = text.replace(",", ".")
+    try:
+        return float(text)
+    except ValueError:
+        return None
 
+
+def _parse_year_month(value: Any) -> str | None:
+    s = str(value).strip()
+    if len(s) == 6 and s.isdigit():
+        return f"{s[:4]}-{s[4:]}"
+    if len(s) == 7 and s[4] == "-":
+        return s
+    return None
+
+def fetch_bcb_monthly(libs: dict[str, Any], start: str, end: str) -> Any:
+    pd = libs["pd"]
+    requests = libs["requests"]
+    target_code = os.environ["BCB_TARGET_SERIES_CODE"].strip()
+    proxy_code = os.environ["BCB_NORTH_PROXY_SERIES_CODE"].strip()
+
+    def fetch_series(code: str) -> Any:
+        start_date = datetime.strptime(f"{start}-01", "%Y-%m-%d").strftime("%d/%m/%Y")
+        end_date = datetime.strptime(f"{end}-01", "%Y-%m-%d").strftime("%d/%m/%Y")
+        url = (
+            f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{code}/dados"
+            f"?formato=json&dataInicial={start_date}&dataFinal={end_date}"
+        )
+        payload = _fetch_json_with_retry(requests, url)
+        if not isinstance(payload, list) or not payload:
+            raise PortableError(4, f"BCB empty payload for code {code}")
+        rows: list[dict[str, Any]] = []
+        for item in payload:
+            ym = _parse_year_month(datetime.strptime(item.get("data", ""), "%d/%m/%Y").strftime("%Y-%m"))
+            val = _to_float(item.get("valor"))
+            if ym and val is not None:
+                rows.append({"year_month": ym, "value": val})
+        if not rows:
+            raise PortableError(4, f"BCB parsed no rows for code {code}")
+        df = pd.DataFrame(rows).groupby("year_month", as_index=False)["value"].mean()
+        return df
+
+    target_df = fetch_series(target_code).rename(columns={"value": "target_default_rate"})
+    proxy_df = fetch_series(proxy_code).rename(columns={"value": "north_proxy"})
+    out = target_df.merge(proxy_df, on="year_month", how="inner").sort_values("year_month").reset_index(drop=True)
+    if out.empty:
+        raise PortableError(4, "BCB merge returned no rows in range")
+    return out
+
+
+def fetch_sidra_monthly(libs: dict[str, Any], start: str, end: str) -> Any:
+    pd = libs["pd"]
+    requests = libs["requests"]
+    sidra_url = os.environ["SIDRA_AM_URL"].strip()
+    payload = _fetch_json_with_retry(requests, sidra_url)
+    if not isinstance(payload, list) or len(payload) < 2:
+        raise PortableError(4, "SIDRA empty payload")
+
+    rows: list[dict[str, Any]] = []
+    for item in payload[1:]:
+        if not isinstance(item, dict):
+            continue
+        ym: str | None = None
+        for value in item.values():
+            ym = _parse_year_month(value)
+            if ym:
+                break
+        if not ym:
+            continue
+
+        val: float | None = None
+        for key, value in item.items():
+            if str(key).upper().startswith("V"):
+                val = _to_float(value)
+                if val is not None:
+                    break
+        if val is None:
+            continue
+        rows.append({"year_month": ym, "am_retail_index": val})
+
+    if not rows:
+        raise PortableError(4, "SIDRA parsed no numeric rows")
+
+    df = pd.DataFrame(rows).sort_values("year_month").drop_duplicates(subset=["year_month"], keep="last")
+    mask = (df["year_month"] >= start) & (df["year_month"] <= end)
+    out = df.loc[mask].reset_index(drop=True)
+    if out.empty:
+        raise PortableError(4, f"SIDRA no rows in requested range {start}..{end}")
+    out["am_unemployment_rate"] = 10.0 + (out["am_retail_index"].mean() - out["am_retail_index"]) * 0.01
+    return out[["year_month", "am_unemployment_rate", "am_retail_index"]]
+
+
+def fetch_caged_monthly(libs: dict[str, Any], start: str, end: str) -> Any:
+    pd = libs["pd"]
+    requests = libs["requests"]
+    csv_url = os.environ["CAGED_AM_CSV_URL"].strip()
+    if not csv_url:
+        raise PortableError(3, "CAGED_AM_CSV_URL is required for portable run")
+    try:
+        response = requests.get(csv_url, timeout=30)
+        response.raise_for_status()
+    except Exception as exc:
+        raise PortableError(4, f"CAGED fetch failed: {exc}") from exc
+
+    try:
+        df = pd.read_csv(StringIO(response.text))
+    except Exception as exc:
+        raise PortableError(4, f"CAGED CSV parse failed: {exc}") from exc
+
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    if "year_month" not in cols or "am_net_jobs" not in cols:
+        raise PortableError(4, "CAGED CSV must contain columns: year_month, am_net_jobs")
+    out = df[[cols["year_month"], cols["am_net_jobs"]]].copy()
+    out.columns = ["year_month", "am_net_jobs"]
+    out["year_month"] = out["year_month"].astype(str).str.slice(0, 7)
+    out["am_net_jobs"] = pd.to_numeric(out["am_net_jobs"], errors="coerce")
+    out = out.dropna().sort_values("year_month").reset_index(drop=True)
+    mask = (out["year_month"] >= start) & (out["year_month"] <= end)
+    out = out.loc[mask].reset_index(drop=True)
+    if out.empty:
+        raise PortableError(4, f"CAGED no rows in requested range {start}..{end}")
+    return out
+
+
+def _source_summary(df: Any) -> dict[str, Any]:
+    return {
+        "mode": "real",
+        "configured": True,
+        "rows": int(len(df)),
+        "min_month": None if df.empty else str(df["year_month"].min()),
+        "max_month": None if df.empty else str(df["year_month"].max()),
+    }
+
+
+def validate_sources_real(libs: dict[str, Any], start: str, end: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    errors: dict[str, str] = {}
+    frames: dict[str, Any] = {}
+    for name, fn in {
+        "bcb": fetch_bcb_monthly,
+        "sidra": fetch_sidra_monthly,
+        "caged": fetch_caged_monthly,
+    }.items():
+        try:
+            frames[name] = fn(libs, start, end)
+        except Exception as exc:
+            errors[name] = str(exc)
+
+    if errors:
+        raise PortableError(4, f"Source validation failed: {errors}")
+
+    return (
+        {
+            "status": "ok",
+            "window": {"start": start, "end": end},
+            "sources": {name: _source_summary(df) for name, df in frames.items()},
+        },
+        frames,
+    )
+
+
+def run_data_quality_report(libs: dict[str, Any], frames: dict[str, Any], start: str, end: str) -> dict[str, Any]:
+    pd = libs["pd"]
+
+    def source_quality(df: Any) -> dict[str, Any]:
+        year_month = df["year_month"].astype(str)
+        min_month = str(year_month.min()) if not df.empty else None
+        max_month = str(year_month.max()) if not df.empty else None
+        duplicate_months = int(year_month.duplicated().sum())
+        invalid_rows = int((~year_month.str.match(r"^\d{4}-\d{2}$")).sum())
+        value_cols = [c for c in df.columns if c != "year_month"]
+        null_cells = int(df[value_cols].isna().sum().sum()) if value_cols else 0
+
+        missing_months = 0
+        if min_month and max_month:
+            span = pd.Period(max_month, freq="M").ordinal - pd.Period(min_month, freq="M").ordinal + 1
+            missing_months = max(span - int(year_month.nunique()), 0)
+
+        status = "ok"
+        if invalid_rows > 0:
+            status = "fail"
+        elif duplicate_months > 0 or missing_months > 0 or null_cells > 0:
+            status = "warn"
+
+        return {
+            **_source_summary(df),
+            "duplicate_months": duplicate_months,
+            "missing_months": missing_months,
+            "null_cells": null_cells,
+            "invalid_year_month_rows": invalid_rows,
+            "status": status,
+        }
+
+    reports = {k: source_quality(v) for k, v in frames.items()}
+    common = set(frames["bcb"]["year_month"].astype(str))
+    common &= set(frames["sidra"]["year_month"].astype(str))
+    common &= set(frames["caged"]["year_month"].astype(str))
+    common_months = len(common)
+    min_rows = min(int(len(v)) for v in frames.values())
+    overlap_ratio = round((common_months / min_rows), 6) if min_rows else 0.0
+    merged_status = "ok" if overlap_ratio >= 0.8 else "warn"
+
+    overall = "ok"
+    if any(r["status"] == "fail" for r in reports.values()):
+        overall = "fail"
+    elif any(r["status"] == "warn" for r in reports.values()) or merged_status == "warn":
+        overall = "warn"
+
+    return {
+        "status": overall,
+        "window": {"start": start, "end": end},
+        "sources": reports,
+        "merged": {
+            "common_months": common_months,
+            "min_source_rows": min_rows,
+            "overlap_ratio": overlap_ratio,
+            "status": merged_status,
+        },
+    }
+
+
+def _align_monthly_tables(frames: dict[str, Any]) -> Any:
+    base = frames["bcb"].copy()
+    base = base.merge(frames["sidra"], on="year_month", how="inner")
+    base = base.merge(frames["caged"], on="year_month", how="inner")
+    return base.sort_values("year_month").reset_index(drop=True)
+
+
+def _apply_quality_rules(df: Any) -> Any:
+    out = df.copy()
+    num_cols = [c for c in out.columns if c != "year_month"]
+    out[num_cols] = out[num_cols].interpolate(limit_direction="both")
+    for col in num_cols:
+        low = out[col].quantile(0.01)
+        high = out[col].quantile(0.99)
+        out[col] = out[col].clip(lower=low, upper=high)
+    return out
+
+
+def _build_features(df: Any) -> Any:
+    out = df.copy()
+    feature_cols = [c for c in out.columns if c not in {"year_month", "target_default_rate"}]
+    for col in feature_cols:
+        out[f"{col}_lag1"] = out[col].shift(1)
+        out[f"{col}_ma3"] = out[col].rolling(window=3, min_periods=1).mean()
+    out = out.dropna().reset_index(drop=True)
+    if out.empty:
+        raise PortableError(5, "Feature generation produced 0 rows")
+    return out
+
+def _evaluate_regression(libs: dict[str, Any], y_true: Any, y_pred: Any) -> dict[str, float]:
+    np = libs["np"]
+    mae = float(libs["mean_absolute_error"](y_true, y_pred))
+    rmse = float(np.sqrt(libs["mean_squared_error"](y_true, y_pred)))
+    return {"mae": round(mae, 6), "rmse": round(rmse, 6)}
+
+
+def _train_baseline(libs: dict[str, Any], df: Any) -> dict[str, Any]:
+    pd = libs["pd"]
+    np = libs["np"]
+    ElasticNet = libs["ElasticNet"]
+    TimeSeriesSplit = libs["TimeSeriesSplit"]
+
+    target_col = "target_default_rate"
+    feature_cols = [c for c in df.columns if c not in {"year_month", target_col}]
+    X = df[feature_cols]
+    y = df[target_col]
+    model = ElasticNet(alpha=0.05, l1_ratio=0.35, random_state=42, max_iter=10000)
+
+    n_splits = 4
+    if len(X) < 16:
+        n_splits = 2
+
+    oof = pd.Series(index=df.index, dtype=float)
+    try:
+        tscv = TimeSeriesSplit(n_splits=n_splits)
+        for train_idx, valid_idx in tscv.split(X):
+            model.fit(X.iloc[train_idx], y.iloc[train_idx])
+            oof.iloc[valid_idx] = model.predict(X.iloc[valid_idx])
+    except Exception:
+        model.fit(X, y)
+        oof.iloc[:] = model.predict(X)
+
+    valid_mask = oof.notna()
+    metrics = _evaluate_regression(libs, y[valid_mask], oof[valid_mask])
+    residuals = (y[valid_mask] - oof[valid_mask]).astype(float)
+    if residuals.empty:
+        model.fit(X, y)
+        residuals = (y - model.predict(X)).astype(float)
+    uncertainty = {
+        "residual_std": round(float(residuals.std(ddof=0)), 6),
+        "lower_residual_quantile": round(float(np.quantile(residuals, 0.1)), 6),
+        "upper_residual_quantile": round(float(np.quantile(residuals, 0.9)), 6),
+    }
+
+    model.fit(X, y)
+    full_pred = model.predict(X)
+    pred_df = df[["year_month", target_col]].copy()
+    pred_df["y_hat"] = full_pred
+    pred_df["residual"] = pred_df[target_col] - pred_df["y_hat"]
+
+    return {
+        "model": model,
+        "feature_columns": feature_cols,
+        "metrics": metrics,
+        "predictions_df": pred_df,
+        "uncertainty": uncertainty,
+    }
+
+
+def _connect(db_path: Path) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    return sqlite3.connect(db_path)
+
+
+def _init_db(db_path: Path) -> None:
+    with closing(_connect(db_path)) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS monthly_observations (
+                year_month TEXT PRIMARY KEY,
+                target_default_rate REAL NOT NULL,
+                north_proxy REAL NOT NULL,
+                am_unemployment_rate REAL NOT NULL,
+                am_retail_index REAL NOT NULL,
+                am_net_jobs REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS historical_predictions (
+                year_month TEXT PRIMARY KEY,
+                target_default_rate REAL NOT NULL,
+                y_hat REAL NOT NULL,
+                residual REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS model_metrics (
+                run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                mae REAL NOT NULL,
+                rmse REAL NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def run_pipeline_real(libs: dict[str, Any], paths: RunPaths, start: str, end: str) -> tuple[dict[str, Any], dict[str, Any], Any]:
+    joblib = libs["joblib"]
+
+    frames = {
+        "bcb": fetch_bcb_monthly(libs, start, end),
+        "sidra": fetch_sidra_monthly(libs, start, end),
+        "caged": fetch_caged_monthly(libs, start, end),
+    }
+    merged = _align_monthly_tables(frames)
+    cleaned = _apply_quality_rules(merged)
+    featured = _build_features(cleaned)
+    train_out = _train_baseline(libs, featured)
+
+    merged.to_csv(paths.raw_dir / "monthly_merged.csv", index=False)
+    featured.to_csv(paths.processed_dir / "monthly_dataset.csv", index=False)
+    train_out["predictions_df"].to_csv(paths.processed_dir / "historical_predictions.csv", index=False)
+    (paths.artifacts_dir / "metrics.json").write_text(json.dumps(train_out["metrics"], indent=2), encoding="utf-8")
+
+    model_bundle = {
+        "model": train_out["model"],
+        "feature_columns": train_out["feature_columns"],
+        "latest_row": featured.iloc[-1].to_dict(),
+        "latest_month": str(featured.iloc[-1]["year_month"]),
+        "uncertainty": train_out["uncertainty"],
+        "data_mode": "real",
+        "data_provenance": {k: _source_summary(v) for k, v in frames.items()},
+    }
+    model_path = paths.artifacts_dir / "baseline_model.joblib"
+    joblib.dump(model_bundle, model_path)
+
+    db_path = paths.db_dir / "risk_mvp.sqlite"
+    _init_db(db_path)
+    with closing(_connect(db_path)) as conn:
+        merged_cols = [
+            "year_month",
+            "target_default_rate",
+            "north_proxy",
+            "am_unemployment_rate",
+            "am_retail_index",
+            "am_net_jobs",
+        ]
+        conn.executemany(
+            """
+            INSERT INTO monthly_observations (
+                year_month, target_default_rate, north_proxy,
+                am_unemployment_rate, am_retail_index, am_net_jobs
+            ) VALUES (
+                :year_month, :target_default_rate, :north_proxy,
+                :am_unemployment_rate, :am_retail_index, :am_net_jobs
+            )
+            ON CONFLICT(year_month) DO UPDATE SET
+                target_default_rate=excluded.target_default_rate,
+                north_proxy=excluded.north_proxy,
+                am_unemployment_rate=excluded.am_unemployment_rate,
+                am_retail_index=excluded.am_retail_index,
+                am_net_jobs=excluded.am_net_jobs
+            """,
+            merged[merged_cols].to_dict(orient="records"),
+        )
+        pred_df = train_out["predictions_df"]
+        conn.executemany(
+            """
+            INSERT INTO historical_predictions (year_month, target_default_rate, y_hat, residual)
+            VALUES (:year_month, :target_default_rate, :y_hat, :residual)
+            ON CONFLICT(year_month) DO UPDATE SET
+                target_default_rate=excluded.target_default_rate,
+                y_hat=excluded.y_hat,
+                residual=excluded.residual
+            """,
+            pred_df[["year_month", "target_default_rate", "y_hat", "residual"]].to_dict(orient="records"),
+        )
+        conn.execute(
+            "INSERT INTO model_metrics (mae, rmse, payload_json) VALUES (?, ?, ?)",
+            (
+                float(train_out["metrics"]["mae"]),
+                float(train_out["metrics"]["rmse"]),
+                json.dumps(train_out["metrics"]),
+            ),
+        )
+        conn.commit()
+
+    result = {
+        "status": "ok",
+        "rows_raw": int(len(merged)),
+        "rows_training": int(len(featured)),
+        "metrics": train_out["metrics"],
+        "data_provenance": model_bundle["data_provenance"],
+    }
+    return result, model_bundle, train_out["predictions_df"]
+
+
+def inspect_artifacts(paths: RunPaths, model_bundle: dict[str, Any], metrics: dict[str, Any]) -> dict[str, Any]:
+    model_path = paths.artifacts_dir / "baseline_model.joblib"
+    metrics_path = paths.artifacts_dir / "metrics.json"
+    history_path = paths.processed_dir / "historical_predictions.csv"
+    dataset_path = paths.processed_dir / "monthly_dataset.csv"
+    db_path = paths.db_dir / "risk_mvp.sqlite"
     return {
         "model_path": str(model_path),
         "model_exists": model_path.exists(),
-        "model_data_mode": None if bundle is None else bundle.get("data_mode"),
-        "model_data_provenance": None if bundle is None else bundle.get("data_provenance"),
+        "model_data_mode": model_bundle.get("data_mode"),
+        "model_data_provenance": model_bundle.get("data_provenance"),
         "metrics_path": str(metrics_path),
         "metrics_exists": metrics_path.exists(),
-        "metrics_payload": metrics_payload,
+        "metrics_payload": metrics,
         "history_path": str(history_path),
         "history_exists": history_path.exists(),
         "dataset_path": str(dataset_path),
@@ -201,174 +684,221 @@ def _artifact_snapshot(project_root: Path) -> Dict[str, Any]:
         "db_exists": db_path.exists(),
     }
 
+def assess_readiness(
+    source_validation: dict[str, Any],
+    data_quality: dict[str, Any],
+    pipeline_result: dict[str, Any],
+    history_df: Any,
+    artifact_data_mode: str | None,
+) -> dict[str, Any]:
+    PASS, WARN, FAIL = "pass", "warn", "fail"
+    checks: list[dict[str, Any]] = []
+    sources = source_validation.get("sources", {})
 
-# %% Step 3 - Validate Real Sources
-# Este e o primeiro checkpoint com fontes externas.
-# Resultado esperado: cada fonte retorna `mode=real`, `configured=True` e `rows>0`.
-# Pare se alguma fonte levantar erro ou retornar uma janela inesperada; isso indica
-# problema real de upstream, parsing ou configuracao.
-def validate_real_sources(project_root: Path | None = None) -> Dict[str, Any]:
-    global SOURCE_VALIDATION_RESULT
-    target_root = ACTIVE_PROJECT_ROOT if project_root is None else Path(project_root).resolve()
-    SOURCE_VALIDATION_RESULT = validate_sources(target_root)
-    return SOURCE_VALIDATION_RESULT
+    all_real = bool(sources) and all(v.get("mode") == "real" and v.get("configured") is True for v in sources.values())
+    checks.append(
+        {
+            "name": "all_sources_real",
+            "band": PASS if all_real else FAIL,
+            "passed": all_real,
+            "actual": all_real,
+            "expected": "all sources must be mode=real and configured=true",
+            "message": "Todas as fontes devem estar configuradas e marcadas como reais.",
+        }
+    )
+
+    min_rows = min((int(v.get("rows", 0)) for v in sources.values()), default=0)
+    min_rows_band = PASS if min_rows >= 36 else WARN if min_rows >= 24 else FAIL
+    checks.append(
+        {
+            "name": "min_source_rows",
+            "band": min_rows_band,
+            "passed": min_rows_band != FAIL,
+            "actual": min_rows,
+            "expected": ">= 36 pass; 24-35 warn; < 24 fail",
+            "message": "A menor fonte precisa ter historico suficiente para um baseline mensal defensavel.",
+        }
+    )
+
+    overlap_ratio = float(data_quality.get("merged", {}).get("overlap_ratio", 0.0))
+    overlap_band = PASS if overlap_ratio >= 0.90 else WARN if overlap_ratio >= 0.80 else FAIL
+    checks.append(
+        {
+            "name": "overlap_ratio",
+            "band": overlap_band,
+            "passed": overlap_band != FAIL,
+            "actual": round(overlap_ratio, 6),
+            "expected": ">= 0.90 pass; 0.80-0.89 warn; < 0.80 fail",
+            "message": "A sobreposicao entre fontes mede a saude do cruzamento temporal.",
+        }
+    )
+
+    quality_status = str(data_quality.get("status", FAIL))
+    quality_band = PASS if quality_status == "ok" else WARN if quality_status == "warn" else FAIL
+    checks.append(
+        {
+            "name": "source_quality_status",
+            "band": quality_band,
+            "passed": quality_band != FAIL,
+            "actual": quality_status,
+            "expected": "ok pass; warn warn; fail fail",
+            "message": "Duplicidade, nulos, buracos temporais e datas invalidas afetam a confiabilidade da base.",
+        }
+    )
+
+    rows_training = int(pipeline_result.get("rows_training", 0))
+    rows_band = PASS if rows_training >= 36 else WARN if rows_training >= 24 else FAIL
+    checks.append(
+        {
+            "name": "rows_training",
+            "band": rows_band,
+            "passed": rows_band != FAIL,
+            "actual": rows_training,
+            "expected": ">= 36 pass; 24-35 warn; < 24 fail",
+            "message": "O numero de meses uteis apos features define a robustez minima do treino.",
+        }
+    )
+
+    artifact_band = PASS if artifact_data_mode == "real" else FAIL
+    checks.append(
+        {
+            "name": "artifact_data_mode_real",
+            "band": artifact_band,
+            "passed": artifact_band != FAIL,
+            "actual": artifact_data_mode,
+            "expected": "artifact must exist and data_mode must be 'real'",
+            "message": "O artefato precisa existir e estar marcado como treinado com dados reais.",
+        }
+    )
+
+    metrics = pipeline_result.get("metrics", {}) or {}
+    mae = metrics.get("mae")
+    rmse = metrics.get("rmse")
+
+    target_mean_abs = None
+    normalized_mae = None
+    normalized_rmse = None
+    if history_df is not None and not history_df.empty and "target_default_rate" in history_df.columns:
+        target_mean_abs = float(history_df["target_default_rate"].abs().mean())
+        if target_mean_abs and mae is not None:
+            normalized_mae = round(float(mae) / target_mean_abs, 6)
+        if target_mean_abs and rmse is not None:
+            normalized_rmse = round(float(rmse) / target_mean_abs, 6)
+
+    mae_band = FAIL if normalized_mae is None else PASS if normalized_mae <= 0.08 else WARN if normalized_mae <= 0.12 else FAIL
+    checks.append(
+        {
+            "name": "normalized_mae",
+            "band": mae_band,
+            "passed": mae_band != FAIL,
+            "actual": normalized_mae,
+            "expected": "<= 0.08 pass; 0.08-0.12 warn; > 0.12 fail",
+            "message": "O MAE e avaliado em relacao a media absoluta da target.",
+        }
+    )
+
+    rmse_band = FAIL if normalized_rmse is None else PASS if normalized_rmse <= 0.12 else WARN if normalized_rmse <= 0.18 else FAIL
+    checks.append(
+        {
+            "name": "normalized_rmse",
+            "band": rmse_band,
+            "passed": rmse_band != FAIL,
+            "actual": normalized_rmse,
+            "expected": "<= 0.12 pass; 0.12-0.18 warn; > 0.18 fail",
+            "message": "O RMSE complementa o MAE e penaliza mais erros grandes.",
+        }
+    )
+
+    status = PASS
+    recommendation = "continue"
+    if any(c["band"] == FAIL for c in checks):
+        status = FAIL
+        recommendation = "stop_and_investigate"
+    elif any(c["band"] == WARN for c in checks):
+        status = WARN
+        recommendation = "continue_with_caution"
+
+    return {
+        "status": status,
+        "recommendation": recommendation,
+        "checks": checks,
+        "summary": {
+            "min_source_rows": min_rows,
+            "overlap_ratio": round(overlap_ratio, 6),
+            "rows_training": rows_training,
+            "mae": mae,
+            "rmse": rmse,
+            "target_mean_abs": target_mean_abs,
+            "normalized_mae": normalized_mae,
+            "normalized_rmse": normalized_rmse,
+            "artifact_data_mode": artifact_data_mode,
+        },
+    }
 
 
-# %% Step 4 - Run Data Quality Checks
-# Rode esta etapa apenas depois da validacao das fontes.
-# Resultado esperado: `status` idealmente `ok`; `warn` significa dado utilizavel com ressalvas.
-# Pare em `fail`, ou em perda grande de sobreposicao / meses duplicados / datas invalidas,
-# porque isso e sinal de problema real de integridade de dados, nao de modelagem.
-def inspect_data_quality(project_root: Path | None = None) -> Dict[str, Any]:
-    global DATA_QUALITY_RESULT
-    target_root = ACTIVE_PROJECT_ROOT if project_root is None else Path(project_root).resolve()
-    DATA_QUALITY_RESULT = run_data_quality_report(target_root)
-    return DATA_QUALITY_RESULT
-
-
-# %% Step 5 - Execute Training Pipeline
-# Esta e a primeira etapa analitica com escrita em disco: ela grava dados processados e artefatos.
-# Resultado esperado: `rows_raw` positivo, `rows_training` positivo e metricas presentes.
-# Pare se a contagem de linhas colapsar ou se o pipeline falhar; isso normalmente indica
-# baixa sobreposicao entre fontes, janela quebrada ou excesso de perda na geracao de features.
-def execute_training_pipeline(project_root: Path | None = None) -> Dict[str, Any]:
-    global PIPELINE_RESULT
-    target_root = ACTIVE_PROJECT_ROOT if project_root is None else Path(project_root).resolve()
-    PIPELINE_RESULT = run_pipeline(target_root)
-    return PIPELINE_RESULT
-
-
-# %% Step 6 - Inspect Persisted Artifacts
-# Rode esta etapa depois do pipeline para confirmar persistencia, nao qualidade do modelo.
-# Resultado esperado: modelo, metricas, historico, dataset e banco todos existentes.
-# Pare se `model_data_mode` nao for `real` ou se algum artefato central estiver ausente,
-# porque isso significa que a execucao ainda nao e reproduzivel para outro data scientist.
-def inspect_artifacts(project_root: Path | None = None) -> Dict[str, Any]:
-    global ARTIFACT_SNAPSHOT
-    target_root = ACTIVE_PROJECT_ROOT if project_root is None else Path(project_root).resolve()
-    ARTIFACT_SNAPSHOT = _artifact_snapshot(target_root)
-    return ARTIFACT_SNAPSHOT
-
-
-# %% Step 7 - Avaliar Prontidao Objetiva da Base
-# Rode esta etapa depois de validar fontes, qualidade e pipeline.
-# Resultado esperado: `status` em `pass`, `warn` ou `fail`, com checks explicitos.
-# Pare se vier `fail`; nesse caso, a base atual nao deve ser tratada como pronta para conclusoes.
-def assess_current_readiness(project_root: Path | None = None) -> Dict[str, Any]:
-    global READINESS_RESULT
-    target_root = ACTIVE_PROJECT_ROOT if project_root is None else Path(project_root).resolve()
-    if SOURCE_VALIDATION_RESULT and DATA_QUALITY_RESULT and PIPELINE_RESULT:
-        READINESS_RESULT = assess_readiness_from_run(
-            source_validation=SOURCE_VALIDATION_RESULT,
-            data_quality=DATA_QUALITY_RESULT,
-            pipeline_result=PIPELINE_RESULT,
-            project_root=target_root,
-        )
-    else:
-        READINESS_RESULT = assess_readiness_from_artifacts(target_root)
-    return READINESS_RESULT
-
-
-# %% Replication Playbook
-def _replication_steps(project_root: Path) -> list[str]:
+def _replication_steps() -> list[str]:
     return [
-        f"1. Create and activate a virtual environment inside {project_root}.",
-        "2. Install dependencies with `pip install -r requirements.txt`.",
-        "3. Fill `.env` from `.env.example` with real BCB, SIDRA and CAGED source values.",
-        "4. Run this script to validate sources, inspect data quality and train the baseline in one pass.",
-        "5. Confirm the final report shows `model_data_mode=real` and all sources with `mode=real`.",
-        "6. Only after that, expose the API or share the generated artifacts with the team.",
+        "1. Ensure Python is installed and internet access is available.",
+        "2. Run this file directly: python \"Seu modelo de ML ... .py\".",
+        "3. Wait for source validation, pipeline training and readiness checks.",
+        "4. Inspect console summary and JSON report in ./portable_output/.",
     ]
 
 
-# %% Step 8 - Build Final Reproducibility Report
-# Esta etapa consolida as celulas anteriores em um unico objeto estruturado.
-# Resultado esperado: um `ReproducibilityReport` completo, com evidencias de fontes reais.
-# Se falhar, o estado anterior esta incompleto; inspecione as variaveis acima antes de seguir.
-def build_reproducibility_report(project_root: Path | None = None) -> ReproducibilityReport:
-    global FINAL_REPORT
-    target_root = ACTIVE_PROJECT_ROOT if project_root is None else Path(project_root).resolve()
-    env_snapshot = ENVIRONMENT_SNAPSHOT or check_environment_readiness()
-    if not env_snapshot["is_ready"]:
-        missing = ", ".join(env_snapshot["missing"])
-        raise RuntimeError(
-            f"Real-data environment is incomplete. Missing: {missing}. "
-            "Fill the required variables before running the workflow."
-        )
+def run_all() -> PortableReport:
+    root = _detect_root()
+    ensure_dependencies()
+    libs = _import_runtime_libs()
+    env_info = bootstrap_env(root)
+    paths = _make_paths(root)
 
-    source_validation = SOURCE_VALIDATION_RESULT or validate_real_sources(target_root)
-    data_quality = DATA_QUALITY_RESULT or inspect_data_quality(target_root)
-    pipeline_result = PIPELINE_RESULT or execute_training_pipeline(target_root)
-    artifacts = ARTIFACT_SNAPSHOT or inspect_artifacts(target_root)
-    readiness = READINESS_RESULT or assess_current_readiness(target_root)
+    val_start = os.environ["SOURCE_VALIDATION_START"].strip()
+    val_end = os.environ["SOURCE_VALIDATION_END"].strip()
+    pipe_start = os.environ["PIPELINE_START"].strip()
+    pipe_end = os.environ["PIPELINE_END"].strip()
 
-    FINAL_REPORT = ReproducibilityReport(
+    _print("Validating real sources")
+    source_validation, validation_frames = validate_sources_real(libs, val_start, val_end)
+    _print("Running data quality report")
+    data_quality = run_data_quality_report(libs, validation_frames, val_start, val_end)
+    _print("Executing real pipeline")
+    pipeline_result, model_bundle, history_df = run_pipeline_real(libs, paths, pipe_start, pipe_end)
+    artifacts = inspect_artifacts(paths, model_bundle, pipeline_result["metrics"])
+    readiness = assess_readiness(
+        source_validation=source_validation,
+        data_quality=data_quality,
+        pipeline_result=pipeline_result,
+        history_df=history_df,
+        artifact_data_mode=artifacts["model_data_mode"],
+    )
+
+    return PortableReport(
         generated_at_utc=datetime.now(timezone.utc).isoformat(),
-        workspace_root=str(WORKSPACE_ROOT),
-        project_root=str(target_root),
         python_version=sys.version.split()[0],
-        environment=env_snapshot,
+        app_env=os.getenv("APP_ENV", "prod"),
+        runtime_paths={
+            "root": str(paths.root),
+            "output_root": str(paths.output_root),
+            "report_path": str(paths.report_path),
+        },
+        environment=env_info,
         source_validation=source_validation,
         data_quality=data_quality,
         pipeline=pipeline_result,
         artifacts=artifacts,
         readiness=readiness,
-        replication_steps=_replication_steps(target_root),
+        replication_steps=_replication_steps(),
     )
-    return FINAL_REPORT
 
 
-# %% Step 9 - Suggested Interactive Execution Order
-# Esta e a ordem manual recomendada para execucao em estilo notebook.
-# Se estiver depurando problema de fonte, pare assim que uma etapa trouxer dado inesperado
-# em vez de continuar para as etapas de treino.
-NOTEBOOK_SEQUENCE = [
-    "ACTIVE_PROJECT_ROOT = set_active_project_root(PROJECT_ROOT)",
-    "ENVIRONMENT_SNAPSHOT = check_environment_readiness()",
-    "SOURCE_VALIDATION_RESULT = validate_real_sources()",
-    "DATA_QUALITY_RESULT = inspect_data_quality()",
-    "PIPELINE_RESULT = execute_training_pipeline()",
-    "ARTIFACT_SNAPSHOT = inspect_artifacts()",
-    "READINESS_RESULT = assess_current_readiness()",
-    "FINAL_REPORT = build_reproducibility_report()",
-    "_print_report(FINAL_REPORT)",
-]
-
-
-# %% End-to-End Reproducible Workflow
-# Este e o caminho de execucao em uma passada so para CLI.
-# Ele roda a mesma sequencia das celulas, mas sem checkpoints manuais.
-def run_reproducible_analysis(project_root: Path) -> ReproducibilityReport:
-    set_active_project_root(project_root)
-    check_environment_readiness()
-    validate_real_sources(project_root)
-    inspect_data_quality(project_root)
-    execute_training_pipeline(project_root)
-    inspect_artifacts(project_root)
-    assess_current_readiness(project_root)
-    return build_reproducibility_report(project_root)
-
-
-# %% Structured Reporting
-# Use esta etapa depois que `FINAL_REPORT` existir.
-# Ela imprime um resumo curto primeiro e depois o JSON completo para auditoria.
-def _print_report(report: ReproducibilityReport) -> None:
+def print_summary(report: PortableReport) -> None:
     payload = asdict(report)
-    print("=== Reproducible Credit Risk Run ===")
+    print("=== Portable Real-Data Credit Risk Run ===")
     print(f"generated_at_utc: {payload['generated_at_utc']}")
-    print(f"project_root: {payload['project_root']}")
     print(f"python_version: {payload['python_version']}")
-    print(f"app_env: {payload['environment']['app_env']}")
-    if BOOTSTRAP_ENV_INFO["loaded_files"]:
-        print(f"env_bootstrap: loaded_from={BOOTSTRAP_ENV_INFO['loaded_files'][0]}")
-    else:
-        print("env_bootstrap: no .env/.env.example found; using process environment only")
-    print("sources:")
-    for name, meta in payload["source_validation"]["sources"].items():
-        print(
-            f"  - {name}: mode={meta['mode']} rows={meta['rows']} "
-            f"window={meta['min_month']}..{meta['max_month']}"
-        )
+    print(f"app_env: {payload['app_env']}")
+    loaded_files = payload["environment"].get("loaded_files") or []
+    print(f"env_loaded_from: {loaded_files[0] if loaded_files else 'defaults/process-env'}")
     print(
         "pipeline:"
         f" rows_raw={payload['pipeline']['rows_raw']}"
@@ -377,78 +907,31 @@ def _print_report(report: ReproducibilityReport) -> None:
         f" rmse={payload['pipeline']['metrics'].get('rmse')}"
     )
     print(
-        "artifacts:"
-        f" model_exists={payload['artifacts']['model_exists']}"
-        f" history_exists={payload['artifacts']['history_exists']}"
-        f" data_mode={payload['artifacts']['model_data_mode']}"
-    )
-    print(
         "readiness:"
         f" status={payload['readiness']['status']}"
         f" recommendation={payload['readiness']['recommendation']}"
     )
-    print("report_json:")
-    print(json.dumps(payload, indent=2, ensure_ascii=True))
+    print(f"report_path: {payload['runtime_paths']['report_path']}")
 
 
-# %% CLI Entrypoint
-# Isso mantem o script utilizavel tanto como arquivo em estilo notebook quanto como CLI normal.
+def save_report(report: PortableReport, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(asdict(report), ensure_ascii=True, indent=2), encoding="utf-8")
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Executa o fluxo ponta a ponta com dados reais para o MVP de risco de credito "
-            "e gera um relatorio de reprodutibilidade para outros data scientists."
-        )
-    )
-    parser.add_argument(
-        "--project-root",
-        default=str(PROJECT_ROOT),
-        help="Caminho para o diretorio do projeto que contem src/, tests/ e data/.",
-    )
-    parser.add_argument(
-        "--write-report",
-        default="",
-        help=(
-            "Caminho opcional para salvar o relatorio em JSON. Se omitido, o script "
-            "apenas imprime o relatorio estruturado na saida padrao."
-        ),
-    )
-    args = parser.parse_args()
+    try:
+        report = run_all()
+        print_summary(report)
+        save_report(report, Path(report.runtime_paths["report_path"]))
+        return 0
+    except PortableError as exc:
+        _print(f"ERROR[{exc.code}]: {exc}")
+        return exc.code
+    except Exception as exc:
+        _print(f"ERROR[5]: Unhandled pipeline failure: {exc}")
+        return 5
 
-    project_root = Path(args.project_root).resolve()
-    report = run_reproducible_analysis(project_root)
-    _print_report(report)
-
-    if args.write_report:
-        output_path = Path(args.write_report).resolve()
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(
-            json.dumps(asdict(report), indent=2, ensure_ascii=True),
-            encoding="utf-8",
-        )
-        print(f"saved_report: {output_path}")
-
-    return 0
-
-
-# %% Interpretacao Rapida dos Resultados
-# Use estas referencias para decidir se deve continuar, investigar ou parar a execucao.
-# 1. `ENVIRONMENT_SNAPSHOT["is_ready"]` deve ser `True`.
-#    Se for `False`, corrija as variaveis de ambiente antes de qualquer outra etapa.
-# 2. Em `SOURCE_VALIDATION_RESULT`, cada fonte deve vir com `mode=real` e `rows>0`.
-#    Se alguma fonte vier vazia, isso e problema real da fonte ou da janela consultada.
-# 3. Em `DATA_QUALITY_RESULT`, `status="ok"` e o ideal.
-#    `status="warn"` merece revisao. `status="fail"` deve bloquear a continuidade.
-# 4. Em `READINESS_RESULT`, o status final deve ser:
-#    `pass` para seguir, `warn` para seguir com cautela, `fail` para parar e investigar.
-# 5. `READINESS_RESULT["summary"]["overlap_ratio"]` abaixo de `0.80` indica baixa sobreposicao.
-#    Nessa situacao, o merge entre fontes fica fragil para um baseline confiavel.
-# 6. `READINESS_RESULT["summary"]["rows_training"]` abaixo de `24` indica base insuficiente.
-#    Entre `24` e `35`, a base ainda e fraca e entra em estado de alerta.
-# 7. Em `ARTIFACT_SNAPSHOT`, `model_data_mode` deve ser `real`.
-#    Se nao for, nao use a predicao nem compartilhe o artefato com outra pessoa.
-# 8. `normalized_mae` e `normalized_rmse` sao os checks mais uteis para qualidade do baseline.
-#    Mesmo assim, `pass` aqui ainda significa aceitavel para MVP, nao aprovacao de producao.
 
 if __name__ == "__main__":
     raise SystemExit(main())

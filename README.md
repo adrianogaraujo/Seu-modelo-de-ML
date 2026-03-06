@@ -42,6 +42,20 @@ Para rodar um alvo menor durante desenvolvimento:
 python -m unittest tests.unit.test_features
 ```
 
+## Arquivo unico portatil (roda sozinho)
+
+Se voce quiser compartilhar apenas um arquivo para outra pessoa executar sem estrutura do projeto:
+
+```bash
+python "Seu modelo de ML está errado e você não sabe — análise de risco de crédito do zero.py"
+```
+
+Comportamento padrao:
+- auto-instala dependencias faltantes;
+- carrega `.env` local se existir (ou usa defaults embutidos);
+- valida fontes reais, executa pipeline e readiness;
+- salva relatorio em `portable_output/report-*.json`.
+
 ## Docker Compose
 
 ```bash
