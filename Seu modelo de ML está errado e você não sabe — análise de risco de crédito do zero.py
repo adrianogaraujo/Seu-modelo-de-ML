@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
+# %% Config Defaults
 DEFAULT_ENV: dict[str, str] = {
     "APP_ENV": "prod",
     "BCB_TARGET_SERIES_CODE": "21085",
@@ -36,6 +37,7 @@ PACKAGE_MAP: dict[str, str] = {
 }
 
 
+# %% Runtime Models
 class PortableError(RuntimeError):
     def __init__(self, code: int, message: str):
         super().__init__(message)
@@ -69,6 +71,7 @@ class PortableReport:
     replication_steps: list[str]
 
 
+# %% Bootstrap and Environment
 def _detect_root() -> Path:
     if "__file__" in globals():
         return Path(__file__).resolve().parent
@@ -234,6 +237,7 @@ def _parse_year_month(value: Any) -> str | None:
         return s
     return None
 
+# %% Real Data Ingestion
 def fetch_bcb_monthly(libs: dict[str, Any], start: str, end: str) -> Any:
     pd = libs["pd"]
     requests = libs["requests"]
@@ -439,6 +443,7 @@ def run_data_quality_report(libs: dict[str, Any], frames: dict[str, Any], start:
     }
 
 
+# %% Processing and Feature Engineering
 def _align_monthly_tables(frames: dict[str, Any]) -> Any:
     base = frames["bcb"].copy()
     base = base.merge(frames["sidra"], on="year_month", how="inner")
@@ -468,6 +473,7 @@ def _build_features(df: Any) -> Any:
         raise PortableError(5, "Feature generation produced 0 rows")
     return out
 
+# %% Modeling
 def _evaluate_regression(libs: dict[str, Any], y_true: Any, y_pred: Any) -> dict[str, float]:
     np = libs["np"]
     mae = float(libs["mean_absolute_error"](y_true, y_pred))
@@ -528,6 +534,7 @@ def _train_baseline(libs: dict[str, Any], df: Any) -> dict[str, Any]:
     }
 
 
+# %% Persistence
 def _connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     return sqlite3.connect(db_path)
@@ -684,6 +691,7 @@ def inspect_artifacts(paths: RunPaths, model_bundle: dict[str, Any], metrics: di
         "db_exists": db_path.exists(),
     }
 
+# %% Readiness Assessment
 def assess_readiness(
     source_validation: dict[str, Any],
     data_quality: dict[str, Any],
@@ -836,6 +844,7 @@ def assess_readiness(
     }
 
 
+# %% Orchestration
 def _replication_steps() -> list[str]:
     return [
         "1. Ensure Python is installed and internet access is available.",
@@ -891,6 +900,7 @@ def run_all() -> PortableReport:
     )
 
 
+# %% Reporting
 def print_summary(report: PortableReport) -> None:
     payload = asdict(report)
     print("=== Portable Real-Data Credit Risk Run ===")
@@ -919,6 +929,7 @@ def save_report(report: PortableReport, path: Path) -> None:
     path.write_text(json.dumps(asdict(report), ensure_ascii=True, indent=2), encoding="utf-8")
 
 
+# %% Entrypoint
 def main() -> int:
     try:
         report = run_all()
@@ -935,3 +946,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
